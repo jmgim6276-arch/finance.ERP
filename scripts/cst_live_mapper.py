@@ -28,7 +28,7 @@ SCRIPT_DIR = resolve_browser_session_dir()
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.append(str(SCRIPT_DIR))
 
-from browser_session import cdp_eval, ensure_cst_page, find_or_launch_browser  # noqa: E402
+from browser_session import cdp_eval, ensure_cst_page, find_or_launch_browser, get_auth  # noqa: E402
 
 
 BASE_URL = "https://cst.uf-tree.com"
@@ -65,7 +65,24 @@ def choose_parallel_exact_candidate(short_value, full_value, master_index):
 
 
 class CSTBrowserRunner:
-    def __init__(self, browser_name="edge", settle_seconds=5):
+    def __init__(
+        self,
+        browser_name="edge",
+        settle_seconds=5,
+        auto_login=False,
+        username=None,
+        password=None,
+        company_id=None,
+        prompt_credentials=False,
+    ):
+        get_auth(
+            auto_login=auto_login,
+            preferred_browser=browser_name,
+            username=username,
+            password=password,
+            company_id=company_id,
+            prompt=prompt_credentials,
+        )
         self.browser = find_or_launch_browser(preferred=browser_name, target_url=f"{BASE_URL}/index")
         if not self.browser:
             raise RuntimeError("未找到可用浏览器。")
@@ -605,8 +622,24 @@ def summarize_rows(rows, name_key):
     return [row.get(name_key) for row in rows]
 
 
-def run(apply_changes=False, browser_name="edge", report_path=None):
-    runner = CSTBrowserRunner(browser_name=browser_name)
+def run(
+    apply_changes=False,
+    browser_name="edge",
+    report_path=None,
+    auto_login=False,
+    username=None,
+    password=None,
+    company_id=None,
+    prompt_credentials=False,
+):
+    runner = CSTBrowserRunner(
+        browser_name=browser_name,
+        auto_login=auto_login,
+        username=username,
+        password=password,
+        company_id=company_id,
+        prompt_credentials=prompt_credentials,
+    )
     report = {"applied": apply_changes, "steps": []}
 
     subject_data = fetch_subject_data(runner)
@@ -697,6 +730,15 @@ def main():
     default_report = Path(__file__).resolve().parent.parent / "cst_live_mapper_report.json"
     parser.add_argument("--apply", action="store_true", help="actually save mappings")
     parser.add_argument("--browser", default="edge", help="browser to attach to")
+    parser.add_argument("--auto-login", action="store_true", help="launch browser and login automatically if needed")
+    parser.add_argument("--username", help="财税通登录手机号; defaults to CST_USERNAME")
+    parser.add_argument("--password", help="财税通登录密码; defaults to CST_PASSWORD")
+    parser.add_argument("--company-id", type=int, help="企业 ID; only needed when the account can enter multiple enterprises")
+    parser.add_argument(
+        "--prompt-credentials",
+        action="store_true",
+        help="prompt in terminal for missing username/password",
+    )
     parser.add_argument(
         "--report",
         default=str(default_report),
@@ -704,7 +746,16 @@ def main():
     )
     args = parser.parse_args()
 
-    report = run(apply_changes=args.apply, browser_name=args.browser, report_path=args.report)
+    report = run(
+        apply_changes=args.apply,
+        browser_name=args.browser,
+        report_path=args.report,
+        auto_login=args.auto_login,
+        username=args.username,
+        password=args.password,
+        company_id=args.company_id,
+        prompt_credentials=args.prompt_credentials,
+    )
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
