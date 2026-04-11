@@ -176,7 +176,76 @@ class CSTBrowserRunner:
             time.sleep(0.5)
         else:
             raise RuntimeError(f"ERP 页面跳转失败: {json.dumps(last_state, ensure_ascii=False)}")
+        self.activate_archive_menu(route_name)
         time.sleep(self.settle_seconds)
+
+    def activate_archive_menu(self, route_name):
+        result = self.eval(
+            f"""
+(() => {{
+  const root = document.querySelector('#app');
+  const vue = root && root.__vue__;
+  function find(vm, seen = new Set()) {{
+    if (!vm || seen.has(vm)) return null;
+    seen.add(vm);
+    const methods = (vm.$options && vm.$options.methods) || {{}};
+    if ((vm.$options && vm.$options.name) === 'erp-settings' && typeof methods.fnClickMenuItem === 'function') {{
+      return vm;
+    }}
+    for (const child of (vm.$children || [])) {{
+      const found = find(child, seen);
+      if (found) return found;
+    }}
+    return null;
+  }}
+  const vm = find(vue);
+  if (!vm) {{
+    return {{ ok: false, reason: 'erp-settings-not-found', href: location.href }};
+  }}
+  vm.fnClickMenuItem({json.dumps(route_name)});
+  return {{
+    ok: true,
+    currentItem: vm.currentItem,
+    href: location.href
+  }};
+}})()
+"""
+        )
+        if not isinstance(result, dict) or not result.get("ok"):
+            raise RuntimeError(f"切换ERP档案菜单失败: {json.dumps(result, ensure_ascii=False)}")
+        deadline = time.time() + 20
+        last_state = result
+        while time.time() < deadline:
+            last_state = self.eval(
+                """
+(() => {
+  const root = document.querySelector('#app');
+  const vue = root && root.__vue__;
+  function find(vm, seen = new Set()) {
+    if (!vm || seen.has(vm)) return null;
+    seen.add(vm);
+    if ((vm.$options && vm.$options.name) === 'erp-settings') {
+      return vm;
+    }
+    for (const child of (vm.$children || [])) {
+      const found = find(child, seen);
+      if (found) return found;
+    }
+    return null;
+  }
+  const vm = find(vue);
+  return {
+    href: location.href,
+    currentItem: vm && vm.currentItem,
+    bodyTextLength: ((document.body && document.body.innerText) || '').trim().length
+  };
+})()
+"""
+            )
+            if (last_state or {}).get("currentItem") == route_name:
+                return
+            time.sleep(0.5)
+        raise RuntimeError(f"ERP档案菜单未切换成功: {json.dumps(last_state, ensure_ascii=False)}")
 
     def get_store_context(self):
         return self.eval(
