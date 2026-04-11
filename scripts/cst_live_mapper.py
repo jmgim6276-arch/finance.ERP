@@ -92,7 +92,7 @@ class CSTBrowserRunner:
     def navigate(self, route_name):
         route_url = f"{BASE_URL}/erp/erpArchiveSetting?name={route_name}"
         self.eval(f"location.href={json.dumps(route_url)}; 'ok'")
-        deadline = time.time() + 20
+        deadline = time.time() + 30
         while time.time() < deadline:
             href = self.eval("location.href")
             if f"name={route_name}" in str(href):
@@ -103,17 +103,21 @@ class CSTBrowserRunner:
     def eval(self, expression, await_promise=False):
         return cdp_eval(self.page, expression, return_by_value=True, await_promise=await_promise)
 
-    def vm_eval(self, marker_method, body, await_promise=True):
+    def vm_eval(self, marker_method, body, await_promise=True, timeout_seconds=30):
         script = f"""
 (async () => {{
   try {{
     const seen = new Set();
     const candidates = [];
+    const methodSamples = [];
     for (const el of Array.from(document.querySelectorAll('*'))) {{
       const v = el && el.__vue__;
       if (!v || seen.has(v)) continue;
       seen.add(v);
       const methods = Object.keys((v.$options && v.$options.methods) || {{}});
+      if (methodSamples.length < 8) {{
+        methodSamples.push(methods.slice(0, 12));
+      }}
       if (!methods.includes({json.dumps(marker_method)})) continue;
       const style = window.getComputedStyle(el);
       const visible = style && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && el.getClientRects().length > 0;
@@ -140,17 +144,37 @@ class CSTBrowserRunner:
         }}
       }}
     }}
-    if (!vm) return {{ __error: 'vm not found', href: location.href, marker: {json.dumps(marker_method)} }};
+    if (!vm) return {{
+      __pending: true,
+      reason: 'vm not found',
+      href: location.href,
+      title: document.title,
+      readyState: document.readyState,
+      marker: {json.dumps(marker_method)},
+      vueCount: seen.size,
+      methodSamples
+    }};
     {body}
   }} catch (error) {{
     return {{ __error: String((error && error.stack) || error) }};
   }}
 }})()
 """
-        result = self.eval(script, await_promise=await_promise)
-        if isinstance(result, dict) and result.get("__error"):
-            raise RuntimeError(result["__error"])
-        return result
+        deadline = time.time() + timeout_seconds
+        last_pending = None
+        while time.time() < deadline:
+            result = self.eval(script, await_promise=await_promise)
+            if isinstance(result, dict):
+                if result.get("__error"):
+                    raise RuntimeError(result["__error"])
+                if result.get("__pending"):
+                    last_pending = result
+                    time.sleep(0.5)
+                    continue
+            return result
+        if last_pending:
+            raise RuntimeError(f"vm not found after wait: {json.dumps(last_pending, ensure_ascii=False)}")
+        raise RuntimeError(f"vm not found after wait: marker={marker_method}")
 
 
 def fetch_department_data(runner):
