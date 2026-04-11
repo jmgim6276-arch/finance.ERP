@@ -410,42 +410,64 @@ return {{
         script = f"""
 (async () => {{
   try {{
-    const seen = new Set();
-    const candidates = [];
+    const vmEntries = new Map();
     const methodSamples = [];
-    for (const el of Array.from(document.querySelectorAll('*'))) {{
-      const v = el && el.__vue__;
-      if (!v || seen.has(v)) continue;
-      seen.add(v);
-      const methods = Object.keys((v.$options && v.$options.methods) || {{}});
-      if (methodSamples.length < 8) {{
-        methodSamples.push(methods.slice(0, 12));
+
+    function noteVm(v, source, el = null) {{
+      if (!v) return;
+      let entry = vmEntries.get(v);
+      if (!entry) {{
+        const methods = Object.keys((v.$options && v.$options.methods) || {{}});
+        entry = {{
+          vm: v,
+          methods,
+          name: (v.$options && v.$options.name) || null,
+          childCount: (v.$children || []).length,
+          sources: [],
+          visible: false,
+          score: 0
+        }};
+        vmEntries.set(v, entry);
+        if (methodSamples.length < 12) {{
+          methodSamples.push(methods.slice(0, 12));
+        }}
       }}
-      if (!methods.includes({json.dumps(marker_method)})) continue;
-      const style = window.getComputedStyle(el);
-      const visible = style && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && el.getClientRects().length > 0;
-      if (!visible) continue;
-      candidates.push({{
-        vm: v,
-        score: (el.innerText || '').length
-      }});
+      if (!entry.sources.includes(source)) {{
+        entry.sources.push(source);
+      }}
+      const targetEl = el || v.$el || null;
+      if (!targetEl || !targetEl.getClientRects) return;
+      const style = window.getComputedStyle(targetEl);
+      const visible = style && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && targetEl.getClientRects().length > 0;
+      const score = (visible ? 100000 : 0) + ((targetEl.innerText || '').length) + entry.childCount * 10;
+      if (score >= entry.score) {{
+        entry.visible = visible;
+        entry.score = score;
+      }}
     }}
+
+    function walk(vm, seen = new Set()) {{
+      if (!vm || seen.has(vm)) return;
+      seen.add(vm);
+      noteVm(vm, 'tree', vm.$el || null);
+      for (const child of (vm.$children || [])) {{
+        walk(child, seen);
+      }}
+    }}
+
+    const root = document.querySelector('#app');
+    const rootVue = root && root.__vue__;
+    walk(rootVue);
+
+    for (const el of Array.from(document.querySelectorAll('*'))) {{
+      noteVm(el && el.__vue__, 'dom', el);
+    }}
+
+    const candidates = Array.from(vmEntries.values()).filter(entry => entry.methods.includes({json.dumps(marker_method)}));
     let vm = null;
     if (candidates.length) {{
       candidates.sort((a, b) => b.score - a.score);
       vm = candidates[0].vm;
-    }} else {{
-      const seen2 = new Set();
-      for (const el of Array.from(document.querySelectorAll('*'))) {{
-        const v = el && el.__vue__;
-        if (!v || seen2.has(v)) continue;
-        seen2.add(v);
-        const methods = Object.keys((v.$options && v.$options.methods) || {{}});
-        if (methods.includes({json.dumps(marker_method)})) {{
-          vm = v;
-          break;
-        }}
-      }}
     }}
     if (!vm) return {{
       __pending: true,
@@ -454,7 +476,31 @@ return {{
       title: document.title,
       readyState: document.readyState,
       marker: {json.dumps(marker_method)},
-      vueCount: seen.size,
+      vueCount: vmEntries.size,
+      candidateSamples: candidates.slice(0, 5).map(item => ({{
+        name: item.name,
+        sources: item.sources,
+        visible: item.visible,
+        score: item.score
+      }})),
+      routeName: rootVue && rootVue.$route ? rootVue.$route.name : null,
+      routePath: rootVue && rootVue.$route ? rootVue.$route.fullPath : null,
+      menuCurrentItem: (() => {{
+        const seen = new Set();
+        function findMenu(current) {{
+          if (!current || seen.has(current)) return null;
+          seen.add(current);
+          if ((current.$options && current.$options.name) === 'erp-settings') {{
+            return current.currentItem || null;
+          }}
+          for (const child of (current.$children || [])) {{
+            const found = findMenu(child);
+            if (found) return found;
+          }}
+          return null;
+        }}
+        return findMenu(rootVue);
+      }})(),
       methodSamples
     }};
     {body}
@@ -480,9 +526,29 @@ return {{
         raise RuntimeError(f"vm not found after wait: marker={marker_method}")
 
 
+def route_vm_eval(runner, route_name, marker_method, body, await_promise=True, timeout_seconds=30, retries=1):
+    last_error = None
+    for attempt in range(retries + 1):
+        runner.navigate(route_name)
+        try:
+            return runner.vm_eval(
+                marker_method,
+                body,
+                await_promise=await_promise,
+                timeout_seconds=timeout_seconds,
+            )
+        except RuntimeError as exc:
+            last_error = exc
+            if "vm not found after wait" not in str(exc) or attempt >= retries:
+                raise
+            time.sleep(1)
+    raise last_error
+
+
 def fetch_department_data(runner):
-    runner.navigate("department")
-    return runner.vm_eval(
+    return route_vm_eval(
+        runner,
+        "department",
         "fnNetRelateItems",
         """
 await vm.fnNetRRelationList();
@@ -496,7 +562,9 @@ return {
 
 
 def save_department_mappings(runner, payload):
-    return runner.vm_eval(
+    return route_vm_eval(
+        runner,
+        "department",
         "fnNetRelateItems",
         f"""
 vm.aRelateItems = {json.dumps(payload, ensure_ascii=False)};
@@ -508,8 +576,9 @@ return vm.aRelationList;
 
 
 def fetch_project_data(runner):
-    runner.navigate("project")
-    return runner.vm_eval(
+    return route_vm_eval(
+        runner,
+        "project",
         "fnNetRelateItems",
         """
 await vm.fnNetRRelationList();
@@ -523,7 +592,9 @@ return {
 
 
 def save_project_mappings(runner, payload):
-    return runner.vm_eval(
+    return route_vm_eval(
+        runner,
+        "project",
         "fnNetRelateItems",
         f"""
 vm.aRelateItems = {json.dumps(payload, ensure_ascii=False)};
@@ -535,8 +606,9 @@ return vm.aRelationList;
 
 
 def fetch_staff_data(runner):
-    runner.navigate("staff")
-    return runner.vm_eval(
+    return route_vm_eval(
+        runner,
+        "staff",
         "fnNetRelateItems",
         """
 await vm.fnNetRRelationList();
@@ -550,7 +622,9 @@ return {
 
 
 def save_staff_mappings(runner, payload):
-    return runner.vm_eval(
+    return route_vm_eval(
+        runner,
+        "staff",
         "fnNetRelateItems",
         f"""
 vm.aRelateItems = {json.dumps(payload, ensure_ascii=False)};
@@ -562,8 +636,9 @@ return vm.aRelationList;
 
 
 def fetch_provider_data(runner):
-    runner.navigate("provider")
-    return runner.vm_eval(
+    return route_vm_eval(
+        runner,
+        "provider",
         "fnSaveCustomerRelation",
         """
 vm.cur = 'relation';
@@ -587,7 +662,9 @@ return {
 
 def save_provider_bank_mappings(runner, payload, receive_type):
     cur = "relation" if receive_type == "BANKCARD" else "receivePayAccount"
-    return runner.vm_eval(
+    return route_vm_eval(
+        runner,
+        "provider",
         "fnSaveCustomerRelation",
         f"""
 vm.cur = {json.dumps(cur)};
@@ -600,7 +677,9 @@ return vm.aRelationList;
 
 
 def save_provider_customer_rows(runner, rows):
-    return runner.vm_eval(
+    return route_vm_eval(
+        runner,
+        "provider",
         "fnSaveCustomerRelation",
         f"""
 const rows = {json.dumps(rows, ensure_ascii=False)};
@@ -614,8 +693,9 @@ return vm.cRelationList;
 
 
 def fetch_subject_data(runner):
-    runner.navigate("subject")
-    return runner.vm_eval(
+    return route_vm_eval(
+        runner,
+        "subject",
         "fnNetSavePayRelateItems",
         """
 await vm.fnNetPayRelationList(1);
@@ -678,7 +758,9 @@ return {
 
 
 def save_subject_mappings(runner, pay_rows, income_rows):
-    return runner.vm_eval(
+    return route_vm_eval(
+        runner,
+        "subject",
         "fnNetSavePayRelateItems",
         f"""
 const payRows = {json.dumps(pay_rows, ensure_ascii=False)};
