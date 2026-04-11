@@ -50,6 +50,12 @@ python3 scripts/cst_live_mapper.py --auto-login --apply
 
 脚本会优先接管当前已登录的浏览器会话；如果登录态失效且传了 `--auto-login`，才会自动打开登录页并提交账号密码。它不会自动放宽匹配规则。
 
+脚本会先进入 `ERP账套`，把当前账套写入前端 store，再进入 `ERP档案关系配置`。如果当前账号下有多个 ERP账套，需要额外指定：
+
+```bash
+python3 scripts/cst_live_mapper.py --auto-login --username 你的手机号 --prompt-credentials --erp-accounting-id 账套ID --apply
+```
+
 只做检查、不保存时:
 
 ```bash

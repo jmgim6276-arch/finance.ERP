@@ -73,6 +73,7 @@ class CSTBrowserRunner:
         username=None,
         password=None,
         company_id=None,
+        erp_accounting_id=None,
         prompt_credentials=False,
     ):
         get_auth(
@@ -88,6 +89,8 @@ class CSTBrowserRunner:
             raise RuntimeError("未找到可用浏览器。")
         self.page = ensure_cst_page(self.browser, url=f"{BASE_URL}/index")
         self.settle_seconds = settle_seconds
+        self.erp_accounting_id = erp_accounting_id
+        self.current_accounting = None
         self.ensure_home_ready()
 
     def ensure_home_ready(self):
@@ -133,18 +136,20 @@ class CSTBrowserRunner:
         raise RuntimeError(f"财税通首页未就绪: {json.dumps(last_state, ensure_ascii=False)}")
 
     def navigate(self, route_name):
+        accounting = self.ensure_erp_archive_context()
         route_url = f"{BASE_URL}/erp/erpArchiveSetting?name={route_name}"
         route_result = self.eval(
             f"""
 (() => {{
   const path = '/erp/erpArchiveSetting';
   const queryName = {json.dumps(route_name)};
+  const params = {{ accountingId: {json.dumps((accounting or {}).get("id"))} }};
   const target = path + '?name=' + encodeURIComponent(queryName);
   const nodes = Array.from(document.querySelectorAll('*'));
   for (const el of nodes) {{
     const vm = el && el.__vue__;
     if (vm && vm.$router && typeof vm.$router.push === 'function') {{
-      vm.$router.push({{ path, query: {{ name: queryName }} }}).catch(() => {{}});
+      vm.$router.push({{ name: 'erp-archive-setting', params, query: {{ name: queryName }} }}).catch(() => {{}});
       return {{ ok: true, mode: 'router', href: location.href, target }};
     }}
   }}
@@ -172,6 +177,162 @@ class CSTBrowserRunner:
         else:
             raise RuntimeError(f"ERP 页面跳转失败: {json.dumps(last_state, ensure_ascii=False)}")
         time.sleep(self.settle_seconds)
+
+    def get_store_context(self):
+        return self.eval(
+            """
+(() => {
+  const root = document.querySelector('#app');
+  const vue = root && root.__vue__;
+  const store = vue && vue.$store;
+  const accounting = store && store.getters ? store.getters.accounting : null;
+  return {
+    href: location.href,
+    title: document.title,
+    readyState: document.readyState,
+    accounting: accounting ? {
+      id: accounting.id,
+      accountingName: accounting.accountingName,
+      accountVersionName: accounting.accountVersionName,
+      version: accounting.version
+    } : null
+  };
+})()
+"""
+        )
+
+    def open_erp_accounting_page(self):
+        accounting_url = f"{BASE_URL}/erp/erpAccounting"
+        route_result = self.eval(
+            f"""
+(() => {{
+  const nodes = Array.from(document.querySelectorAll('*'));
+  for (const el of nodes) {{
+    const vm = el && el.__vue__;
+    if (vm && vm.$router && typeof vm.$router.push === 'function') {{
+      vm.$router.push({{ name: 'erp-accounting' }}).catch(() => {{}});
+      return {{ ok: true, mode: 'router', href: location.href }};
+    }}
+  }}
+  location.href = {json.dumps(accounting_url)};
+  return {{ ok: true, mode: 'href', href: location.href }};
+}})()
+"""
+        )
+        deadline = time.time() + 30
+        last_state = route_result
+        while time.time() < deadline:
+            last_state = self.eval(
+                """
+(() => ({
+  href: location.href,
+  title: document.title,
+  readyState: document.readyState
+}))()
+"""
+            )
+            if "/erp/erpAccounting" in str((last_state or {}).get("href", "")):
+                time.sleep(self.settle_seconds)
+                return
+            time.sleep(0.5)
+        raise RuntimeError(f"ERP账套页面跳转失败: {json.dumps(last_state, ensure_ascii=False)}")
+
+    def choose_erp_accounting(self, rows, current=None):
+        if not rows:
+            raise RuntimeError("ERP账套列表为空，无法进入档案配置。")
+        if self.erp_accounting_id is not None:
+            for row in rows:
+                if int(row.get("id")) == int(self.erp_accounting_id):
+                    return row
+            raise RuntimeError(f"未在ERP账套列表中找到 id={self.erp_accounting_id}")
+        current_id = (current or {}).get("id")
+        if current_id is not None:
+            for row in rows:
+                if int(row.get("id")) == int(current_id):
+                    return row
+        if len(rows) == 1:
+            return rows[0]
+        brief = [
+            {
+                "id": row.get("id"),
+                "accountingName": row.get("accountingName"),
+                "version": row.get("version"),
+            }
+            for row in rows
+        ]
+        raise RuntimeError(
+            f"检测到多个ERP账套，请通过 --erp-accounting-id 指定要操作的账套: {json.dumps(brief, ensure_ascii=False)}"
+        )
+
+    def enter_archive_settings_via_accounting(self):
+        self.open_erp_accounting_page()
+        info = self.vm_eval(
+            "archiveSetting",
+            """
+if (typeof vm.fnNetRTableData === 'function') {
+  await vm.fnNetRTableData();
+}
+const rows = (((vm.accountingResult || {}).data) || vm.aList || []).map(item => JSON.parse(JSON.stringify(item)));
+const current = vm.$store && vm.$store.getters && vm.$store.getters.accounting
+  ? JSON.parse(JSON.stringify(vm.$store.getters.accounting))
+  : null;
+return { rows, current };
+""",
+        )
+        rows = info.get("rows") or []
+        chosen = self.choose_erp_accounting(rows, current=info.get("current"))
+        self.vm_eval(
+            "archiveSetting",
+            f"""
+if (typeof vm.fnNetRTableData === 'function') {{
+  await vm.fnNetRTableData();
+}}
+const targetId = {json.dumps(chosen.get("id"))};
+const rows = (((vm.accountingResult || {{}}).data) || vm.aList || []).map(item => JSON.parse(JSON.stringify(item)));
+const row = rows.find(item => Number(item.id) === Number(targetId));
+if (!row) {{
+  return {{ __error: 'erp accounting row not found', targetId, rows }};
+}}
+vm.archiveSetting(row);
+return {{
+  chosen: {{
+    id: row.id,
+    accountingName: row.accountingName,
+    version: row.version
+  }}
+}};
+""",
+        )
+        deadline = time.time() + 30
+        last_state = None
+        while time.time() < deadline:
+            last_state = self.get_store_context()
+            accounting = (last_state or {}).get("accounting") or {}
+            href = str((last_state or {}).get("href", ""))
+            if (
+                int(accounting.get("id") or 0) == int(chosen.get("id") or 0)
+                and "/erp/erpArchiveSetting" in href
+            ):
+                self.current_accounting = accounting
+                time.sleep(self.settle_seconds)
+                return accounting
+            time.sleep(0.5)
+        raise RuntimeError(f"进入ERP档案配置失败: {json.dumps(last_state, ensure_ascii=False)}")
+
+    def ensure_erp_archive_context(self):
+        context = self.get_store_context()
+        accounting = (context or {}).get("accounting")
+        if (
+            accounting
+            and accounting.get("id")
+            and (
+                self.erp_accounting_id is None
+                or int(accounting.get("id")) == int(self.erp_accounting_id)
+            )
+        ):
+            self.current_accounting = accounting
+            return accounting
+        return self.enter_archive_settings_via_accounting()
 
     def eval(self, expression, await_promise=False):
         return cdp_eval(self.page, expression, return_by_value=True, await_promise=await_promise)
@@ -727,6 +888,7 @@ def run(
     username=None,
     password=None,
     company_id=None,
+    erp_accounting_id=None,
     prompt_credentials=False,
 ):
     runner = CSTBrowserRunner(
@@ -735,9 +897,15 @@ def run(
         username=username,
         password=password,
         company_id=company_id,
+        erp_accounting_id=erp_accounting_id,
         prompt_credentials=prompt_credentials,
     )
-    report = {"applied": apply_changes, "steps": []}
+    runner.ensure_erp_archive_context()
+    report = {
+        "applied": apply_changes,
+        "erp_accounting": runner.current_accounting,
+        "steps": [],
+    }
 
     subject_data = fetch_subject_data(runner)
     subject_plan = build_subject_payloads(subject_data)
@@ -831,6 +999,7 @@ def main():
     parser.add_argument("--username", help="财税通登录手机号; defaults to CST_USERNAME")
     parser.add_argument("--password", help="财税通登录密码; defaults to CST_PASSWORD")
     parser.add_argument("--company-id", type=int, help="企业 ID; only needed when the account can enter multiple enterprises")
+    parser.add_argument("--erp-accounting-id", type=int, help="ERP账套 ID; required only when the account has multiple ERP账套")
     parser.add_argument(
         "--prompt-credentials",
         action="store_true",
@@ -851,6 +1020,7 @@ def main():
         username=args.username,
         password=args.password,
         company_id=args.company_id,
+        erp_accounting_id=args.erp_accounting_id,
         prompt_credentials=args.prompt_credentials,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
