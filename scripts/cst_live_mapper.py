@@ -88,16 +88,89 @@ class CSTBrowserRunner:
             raise RuntimeError("未找到可用浏览器。")
         self.page = ensure_cst_page(self.browser, url=f"{BASE_URL}/index")
         self.settle_seconds = settle_seconds
+        self.ensure_home_ready()
+
+    def ensure_home_ready(self):
+        target_url = f"{BASE_URL}/index"
+        self.eval(
+            f"""
+(() => {{
+  if (location.href !== {json.dumps(target_url)}) {{
+    location.href = {json.dumps(target_url)};
+  }}
+  return 'ok';
+}})()
+"""
+        )
+        deadline = time.time() + 30
+        last_state = None
+        while time.time() < deadline:
+            last_state = self.eval(
+                """
+(() => {
+  const root = document.querySelector('#app');
+  const vue = root && root.__vue__;
+  return {
+    href: location.href,
+    title: document.title,
+    readyState: document.readyState,
+    hasVueRoot: !!vue,
+    hasRouter: !!(vue && vue.$router),
+    bodyTextLength: ((document.body && document.body.innerText) || '').trim().length
+  };
+})()
+"""
+            )
+            if (
+                isinstance(last_state, dict)
+                and "/index" in str(last_state.get("href", ""))
+                and last_state.get("readyState") == "complete"
+                and last_state.get("hasRouter")
+            ):
+                time.sleep(self.settle_seconds)
+                return
+            time.sleep(0.5)
+        raise RuntimeError(f"财税通首页未就绪: {json.dumps(last_state, ensure_ascii=False)}")
 
     def navigate(self, route_name):
         route_url = f"{BASE_URL}/erp/erpArchiveSetting?name={route_name}"
-        self.eval(f"location.href={json.dumps(route_url)}; 'ok'")
+        route_result = self.eval(
+            f"""
+(() => {{
+  const path = '/erp/erpArchiveSetting';
+  const queryName = {json.dumps(route_name)};
+  const target = path + '?name=' + encodeURIComponent(queryName);
+  const nodes = Array.from(document.querySelectorAll('*'));
+  for (const el of nodes) {{
+    const vm = el && el.__vue__;
+    if (vm && vm.$router && typeof vm.$router.push === 'function') {{
+      vm.$router.push({{ path, query: {{ name: queryName }} }}).catch(() => {{}});
+      return {{ ok: true, mode: 'router', href: location.href, target }};
+    }}
+  }}
+  location.href = {json.dumps(route_url)};
+  return {{ ok: true, mode: 'href', href: location.href, target }};
+}})()
+"""
+        )
         deadline = time.time() + 30
+        last_state = route_result
         while time.time() < deadline:
-            href = self.eval("location.href")
-            if f"name={route_name}" in str(href):
+            last_state = self.eval(
+                """
+(() => ({
+  href: location.href,
+  title: document.title,
+  readyState: document.readyState,
+  bodyTextLength: ((document.body && document.body.innerText) || '').trim().length
+}))()
+"""
+            )
+            if f"name={route_name}" in str((last_state or {}).get("href", "")):
                 break
             time.sleep(0.5)
+        else:
+            raise RuntimeError(f"ERP 页面跳转失败: {json.dumps(last_state, ensure_ascii=False)}")
         time.sleep(self.settle_seconds)
 
     def eval(self, expression, await_promise=False):
